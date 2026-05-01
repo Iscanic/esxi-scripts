@@ -4,129 +4,156 @@ PowerShell scripts for ESXi/vSphere management and auditing.
 
 ---
 
-## secureboot-audit.ps1
+## Secure Boot Certificate Remediation (Microsoft 2026 EOL)
 
-Audit Secure Boot certificate status in VMware virtual machines across vSphere environments, identifying VMs affected by Microsoft Secure Boot certificate EOL (June 2026).
+Microsoft Secure Boot UEFI certificates expire **30 June 2026**. VMware VMs created on ESXi 8.0.1 and below (or 7.x) have the 2011 certificate chain baked into their vUEFI NVRAM.
 
-### Background
-
-VMware vSphere VMs initialize their vUEFI Secure Boot certificates at first power-on and retain them for the **lifetime of the VM**. This is the core issue:
-
-| ESXi Version (at VM creation) | VM Hardware Ver | Certificates | KEK Expiry |
-|---|---|---|---|
-| ESXi 9.x | v14+ | 2023 chain | Mar 2038 ✅ |
-| ESXi 8.0.2+ | v21+ | 2023 chain | Mar 2038 ✅ |
-| ESXi 8.0.0–8.0.1 | any | 2011 chain | Jun 2026 ❌ |
-| ESXi 7.x | any | 2011 chain | Jun 2026 ❌ |
-
-VMs created on ESXi 8.0.1 and below (or 7.x) have the **2011 certificate chain** baked into their vNVRAM. The affected certificates expire **30 June 2026**:
+### Affected Certificates
 
 - Microsoft Windows Production PCA 2011 (DB)
 - Microsoft Corporation UEFI CA 2011 (DB)
 - Microsoft Corporation KEK CA 2011 (KEK)
 
-**Key points:**
+### Impact
 
-- **It's not about ESXi host firmware.** Upgrading ESXi does **not** retroactively update existing VM certificates.
-- **VMs will continue to boot** after the cert expiry — boot is only impacted when Microsoft revokes the 2011 DB certificates.
-- **An expired KEK** impacts the ability to update Secure Boot databases (DB, DBX) — future revocation updates will fail.
-- **Affected workflows:** BitLocker VBS, Windows Update signed boot components, any authenticated Secure Boot update.
+- VMs will **continue to boot** after expiry
+- After Microsoft revokes the 2011 DB certificates, VMs **cannot apply Secure Boot database updates** (DB, DBX, KEK)
+- Affected workflows: BitLocker VBS, Windows Update signed boot components, authenticated Secure Boot updates
 
-### What it does
+### Remediation Process
 
-1. Enumerates VMs from vCenter (all VMs, Secure Boot only, or filtered by cluster/datacenter/host)
-2. Checks each VM's Secure Boot configuration and certificate status
-3. Uses **version-based inference** to determine cert chain from ESXi version + VM hardware version (works for powered-off VMs)
-4. For powered-on VMs with guest access, performs **direct certificate verification** via `Invoke-VMScript` querying the vUEFI database
-5. Generates a CSV report and console summary
+The fix is at the **VM level**, not the host level. Follow this sequence:
 
-### Requirements
+1. **Audit** — Run `secureboot-audit.ps1` to identify affected VMs
+2. **Update PK** — Run `Update-SecureBootPK-VM.ps1` to replace the invalid Platform Key
+3. **Update KEK** — Run `Update-SecureBootKEK-VM.ps1` to enroll the 2023 KEK
+4. **Update DB/DBX** — Run Windows Update on guest OS to apply new DB/DBX certificates
 
-- **PowerShell 5.1+** on Windows
-- **VMware PowerCLI** module
-  - Install: `Install-Module -Name VMware.PowerCLI -Force`
-- **vCenter Server** access (or ESXi direct connection)
-- **Guest credentials** (optional) — for direct vUEFI certificate verification on powered-on VMs
+### Prerequisites
 
-### Usage
+- VMware PowerCLI: `Install-Module -Name VMware.PowerCLI -Force`
+- Guest OS credentials (for verification)
+- vCenter access or ESXi direct connection
+- **⚠️ BitLocker/vTPM:** If VM has vTPM with disk encryption, back up recovery keys before proceeding
 
-**Connect and audit all VMs:**
+---
 
-```powershell
-.\secureboot-audit.ps1 -vCenter "vc.domain.local" -vCredUser "administrator@vsphere.local" -vCredPass "password" -AuditAll
-```
+## Scripts
 
-**Audit only Secure Boot VMs (recommended):**
+### secureboot-audit.ps1
 
-```powershell
-.\secureboot-audit.ps1 -vCenter "vc.domain.local" -vCredUser "administrator@vsphere.local" -vCredPass "password" -SecureBootOnly
-```
+Audit Secure Boot certificate status in VMware VMs.
 
-**Filter by cluster:**
+See audit script documentation below.
 
-```powershell
-.\secureboot-audit.ps1 -vCenter "vc.domain.local" -vCredUser "admin" -vCredPass "pass" -SecureBootOnly -Cluster "Production"
-```
+### Update-SecureBootPK-VM.ps1
 
-**Filter by datacenter:**
+Update the Secure Boot Platform Key (PK) from the invalid 2011 cert to the valid Windows OEM Devices PK.
+
+**Usage:**
 
 ```powershell
-.\secureboot-audit.ps1 -vCenter "vc.domain.local" -vCredUser "admin" -vCredPass "pass" -AuditAll -Datacenter "London", "Frankfurt"
-```
+# Interactive (prompts for confirmation)
+.\Update-SecureBootPK-VM.ps1 -VMName "my-vm" -vCenter "vc.domain.local" -vCredUser "admin" -vCredPass "password"
 
-**Filter by specific ESXi hosts:**
+# With guest credentials for verification
+.\Update-SecureBootPK-VM.ps1 -VMName "my-vm" -vCenter "vc.domain.local" -vCredUser "admin" -vCredPass "password" -GuestUser "Administrator" -GuestPass "password"
 
-```powershell
-.\secureboot-audit.ps1 -vCenter "vc.domain.local" -vCredUser "admin" -vCredPass "pass" -SecureBootOnly -ESXiHost "esxi01", "esxi02"
-```
-
-**Use existing PowerCLI session:**
-
-```powershell
+# Using existing PowerCLI session
 Connect-VIServer "vc.domain.local"
-.\secureboot-audit.ps1 -AuditAll
+.\Update-SecureBootPK-VM.ps1 -VMName "my-vm"
 ```
 
-### Output
+**What it does:**
 
-- **CSV report** — `SecureBootAudit_YYYYMMDD_HHMMSS.csv` in the script directory
-- **Log file** — `SecureBootAudit_YYYYMMDD_HHMMSS.log` with scan details
-- **Console summary** — certificate chain status breakdown and affected VMs table
+1. Shuts down VM
+2. Creates snapshot
+3. Downloads PK cert from Microsoft
+4. Attaches 128MB disk
+5. Enables `uefi.allowAuthBypass = "TRUE"` and Force EFI Setup
+6. Boots VM into EFI firmware setup
 
-### Certificate Status Classifications
+After this script completes, you must manually complete EFI setup (see below), then verify and proceed to KEK update.
 
-| Status | Meaning |
-|---|---|
-| **GOOD (2023)** | VM has the 2023 certificate chain — no action needed |
-| **AFFECTED (2011)** | VM has the 2011 certificate chain — will break after Jun 2026 revocation |
-| **UNKNOWN** | Cannot determine cert chain — needs guest-level verification |
-| **N/A** | Secure Boot is disabled on this VM |
+### Update-SecureBootKEK-VM.ps1
 
-### Remediation for Affected VMs
+Update the Secure Boot Key Exchange Key (KEK) from the expired 2011 cert to the 2023 KEK.
 
-The fix is at the **VM level**, not the host level. VMware provides two paths:
+**Usage:**
 
-**1. VMware Manual PK Update** (Article [423919](https://knowledge.broadcom.com/external/article/423919))
+```powershell
+.\Update-SecureBootKEK-VM.ps1 -VMName "my-vm" -vCenter "vc.domain.local" -vCredUser "admin" -vCredPass "password"
+```
 
-Update the Platform Key (PK) to a valid certificate, then follow Microsoft's Secure Boot update guidance. This is the supported VMware path.
+**What it does:**
 
-**2. Manual Update via Guest OS (Windows)**
+1. Verifies PK is valid (prerequisite)
+2. Shuts down VM, creates snapshot
+3. Downloads and converts KEK-2023 certificate
+4. Attaches 128MB disk with KEK cert
+5. Enables EFI auth bypass and Force EFI Setup
+6. Boots VM for manual KEK enrollment
 
-For powered-on Windows VMs with administrative access:
+---
 
-1. Update PK to Windows OEM Devices PK (valid certificate)
-2. Add `Microsoft Corporation KEK 2K CA 2023` to the KEK database
-3. Run Windows Update to apply new DB/DBX certificates
-4. Verify: `Get-SecureBootUEFI`
+## Manual EFI Setup Steps
 
-For Linux VMs, use `mokutil --update-key` to add new KEK certificates via VMware's Secure Boot update mechanisms.
+Both update scripts prepare the VM and boot into EFI setup. You must complete these steps manually in the firmware interface:
 
-**3. New VMs**
+### PK Update (after running `Update-SecureBootPK-VM.ps1`)
 
-VMs created on ESXi 8.0.2+ with HW v21+ (or any ESXi 9.x) already have the 2023 certificate chain. No action needed.
+1. Press **F2** during boot to enter EFI Setup
+2. Navigate to: **Secure Boot Configuration → PK Options → Enroll PK**
+3. Select the PK cert from the attached FAT32 disk
+4. Review and **Commit** changes
+5. Exit EFI Setup and let VM boot
 
-### Timeline
+### KEK Update (after running `Update-SecureBootKEK-VM.ps1`)
 
-- **30 June 2026** — Microsoft 2011 certificates expire
-- **After revocation** — VMs can no longer apply DB/DBX Secure Boot updates
-- **Target:** Audit all VMs and remediate affected ones well before June 2026
+1. Press **F2** during boot to enter EFI Setup
+2. Navigate to: **Secure Boot Configuration → KEK Options → Enroll KEK**
+3. Select the `KEK-2023.der` file from the attached disk
+4. Review and **Commit** changes
+5. Exit EFI Setup and reboot
+
+---
+
+## Post-Update Verification
+
+### Check PK (Windows guest)
+
+```powershell
+$pk = Get-SecureBootUEFI -Name PK
+$bytes = $pk.Bytes
+$cert = $bytes[44..($bytes.Length-1)]
+[IO.File]::WriteAllBytes("PK.der", $cert)
+certutil -dump PK.der
+# Should show "Microsoft" in output (not "00 ." which indicates invalid/null PK)
+```
+
+### Check KEK (Windows guest)
+
+```powershell
+[System.Text.Encoding]::ASCII.GetString((Get-SecureBootUEFI KEK).Bytes) -match "Microsoft Corporation KEK 2K CA 2023"
+# Should return True
+```
+
+### Linux guest
+
+```bash
+mokutil --pk     # Should show valid cert, not empty
+mokutil --kek    # Should list "Microsoft Corporation KEK 2K CA 2023"
+```
+
+### Final Step: Update DB/DBX
+
+Run **Windows Update** on the guest OS to apply the new DB/DBX certificate revocations. This is handled automatically by Windows Update once the PK and KEK are valid.
+
+---
+
+## References
+
+- VMware KB 423919: [Manual Update of the Secure Boot Platform Key in Virtual Machines](https://knowledge.broadcom.com/external/article/423919)
+- VMware KB 423893: [Secure Boot Certificate Expirations and Update Failures in VMware Virtual Machines](https://knowledge.broadcom.com/external/article/423893)
+- Microsoft: [Secure Boot Certificate updates: Guidance for IT professionals](https://support.microsoft.com/en-us/topic/secure-boot-certificate-updates-guidance-for-it-professionals-and-organizations-e2b43f9f-b424-42df-bc6a-8476db65ab2f)
+- Microsoft Secure Boot Objects: [GitHub repository](https://github.com/microsoft/secureboot_objects)
